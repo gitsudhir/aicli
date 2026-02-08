@@ -8,9 +8,9 @@ use std::process::Command;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,10 @@ struct App {
     last_response: Option<String>,
     last_command_output: Option<String>,
     input_mode: InputMode,
+    output_scroll: usize,
+    output_content_len: usize,
+    output_view_height: usize,
+    auto_scroll: bool,
     is_loading: bool,
     spinner_idx: usize,
 }
@@ -58,6 +62,10 @@ impl App {
             last_response: None,
             last_command_output: None,
             input_mode: InputMode::Text,
+            output_scroll: 0,
+            output_content_len: 0,
+            output_view_height: 0,
+            auto_scroll: false,
             is_loading: false,
             spinner_idx: 0,
         }
@@ -101,6 +109,7 @@ impl App {
             InputMode::Text => {
                 self.is_loading = true;
                 self.last_response = None;
+                self.auto_scroll = true;
                 thread::spawn(move || {
                     let result = call_ollama(&prompt).map_err(|err| err.to_string());
                     let _ = tx.send(result);
@@ -108,38 +117,75 @@ impl App {
             }
             InputMode::Command => {
                 self.last_command_output = Some(run_command(&prompt));
+                self.auto_scroll = true;
             }
         }
         self.input.clear();
         self.cursor = 0;
+    }
+
+    fn scroll_up(&mut self, by: usize) {
+        self.output_scroll = self.output_scroll.saturating_sub(by);
+    }
+
+    fn scroll_down(&mut self, by: usize) {
+        let max_scroll = self
+            .output_content_len
+            .saturating_sub(self.output_view_height);
+        self.output_scroll = (self.output_scroll + by).min(max_scroll);
+    }
+
+    fn scroll_to_start(&mut self) {
+        self.output_scroll = 0;
+    }
+
+    fn scroll_to_end(&mut self) {
+        let max_scroll = self
+            .output_content_len
+            .saturating_sub(self.output_view_height);
+        self.output_scroll = max_scroll;
     }
 }
 
 #[derive(Serialize)]
 struct OllamaRequest<'a> {
     model: &'a str,
-    prompt: &'a str,
+    messages: Vec<OllamaMessage<'a>>,
     stream: bool,
+}
+
+#[derive(Serialize)]
+struct OllamaMessage<'a> {
+    role: &'a str,
+    content: &'a str,
 }
 
 #[derive(Deserialize)]
 struct OllamaResponse {
-    response: String,
+    message: OllamaResponseMessage,
+}
+
+#[derive(Deserialize)]
+struct OllamaResponseMessage {
+    content: String,
 }
 
 fn call_ollama(prompt: &str) -> Result<String, Box<dyn Error>> {
     let client = reqwest::blocking::Client::new();
     let req = OllamaRequest {
-        model: "llama3",
-        prompt,
+        model: "qwen2.5-coder:14b",
+        messages: vec![OllamaMessage {
+            role: "user",
+            content: prompt,
+        }],
         stream: false,
     };
     let res: OllamaResponse = client
-        .post("http://localhost:11434/api/generate")
+        .post("http://localhost:11434/api/chat")
         .json(&req)
         .send()?
         .json()?;
-    Ok(res.response)
+    Ok(res.message.content)
 }
 
 fn run_command(cmd: &str) -> String {
@@ -179,17 +225,6 @@ fn inner_height(area: ratatui::layout::Rect) -> usize {
     area.height.saturating_sub(2) as usize
 }
 
-fn tail_lines(text: &str, max_lines: usize) -> String {
-    if max_lines == 0 {
-        return String::new();
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= max_lines {
-        return text.to_string();
-    }
-    lines[lines.len() - max_lines..].join("\n")
-}
-
 fn truncate_input(input: &str, cursor: usize, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -204,6 +239,11 @@ fn truncate_input(input: &str, cursor: usize, max_width: usize) -> String {
         start = len - max_width;
     }
     input[start..start + max_width].to_string()
+}
+
+fn line_count(text: &str) -> usize {
+    let count = text.lines().count();
+    if count == 0 { 1 } else { count }
 }
 
 fn cursor_x_in_view(input: &str, cursor: usize, max_width: usize) -> usize {
@@ -236,6 +276,7 @@ fn run_app(
                 Ok(resp) => app.last_response = Some(resp),
                 Err(err) => app.last_response = Some(format!("Error: {}", err)),
             }
+            app.auto_scroll = true;
         }
         if last_tick.elapsed() >= Duration::from_millis(100) {
             app.spinner_idx = (app.spinner_idx + 1) % spinner.len();
@@ -262,9 +303,9 @@ fn run_app(
             let info_title = match app.input_mode {
                 InputMode::Text => {
                     if app.is_loading {
-                        format!("Llama3 Response {}", spinner[app.spinner_idx])
+                        format!("Response {}", spinner[app.spinner_idx])
                     } else {
-                        "Llama3 Response".to_string()
+                        "Response".to_string()
                     }
                 }
                 InputMode::Command => "Command Output".to_string(),
@@ -290,12 +331,37 @@ fn run_app(
                     .unwrap_or("Type a command and press Enter.")
                     .to_string(),
             };
-            let info_text = tail_lines(&raw_info_text, inner_height(chunks[0]));
-            let info = Paragraph::new(info_text)
+            let view_height = inner_height(chunks[0]);
+            app.output_content_len = line_count(&raw_info_text);
+            app.output_view_height = view_height;
+            if app.auto_scroll {
+                app.scroll_to_end();
+                app.auto_scroll = false;
+            } else if app.output_scroll
+                > app
+                    .output_content_len
+                    .saturating_sub(app.output_view_height)
+            {
+                app.scroll_to_end();
+            }
+
+            let info = Paragraph::new(raw_info_text)
                 .style(info_text_style)
+                .scroll((app.output_scroll as u16, 0))
                 .wrap(Wrap { trim: true })
                 .block(info_block);
             frame.render_widget(info, chunks[0]);
+
+            let mut scrollbar_state = ScrollbarState::new(app.output_content_len)
+                .position(app.output_scroll);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .track_style(Style::default().fg(Color::DarkGray))
+                .thumb_style(Style::default().fg(Color::Blue));
+            frame.render_stateful_widget(
+                scrollbar,
+                chunks[0].inner(Margin { vertical: 1, horizontal: 0 }),
+                &mut scrollbar_state,
+            );
 
             let input_title = match app.input_mode {
                 InputMode::Text => "Prompt (Text)",
@@ -316,15 +382,19 @@ fn run_app(
             let cursor_x = cursor_x_in_view(&app.input, app.cursor, inner_width(chunks[1]));
             let x = chunks[1].x + 1 + cursor_x as u16;
             let y = chunks[1].y + 1;
-            frame.set_cursor(x, y);
+            frame.set_cursor_position((x, y));
 
             let help_block = Block::bordered()
                 .title("Controls")
                 .title_style(title_style)
                 .border_style(help_border);
             let help_text = match app.input_mode {
-                InputMode::Text => "Enter: Send to LLM | Tab: Toggle to Command | Esc/Ctrl+C: Quit",
-                InputMode::Command => "Enter: Run command | Tab: Toggle to Text | Esc/Ctrl+C: Quit",
+                InputMode::Text => {
+                    "Enter: Send to LLM | Tab: Toggle | Up/Down/PgUp/PgDn/Home/End: Scroll | Esc/Ctrl+C: Quit"
+                }
+                InputMode::Command => {
+                    "Enter: Run command | Tab: Toggle | Up/Down/PgUp/PgDn/Home/End: Scroll | Esc/Ctrl+C: Quit"
+                }
             };
             let help = Paragraph::new(help_text)
                 .style(help_text_style)
@@ -344,6 +414,12 @@ fn run_app(
                     }
                     KeyCode::Esc => return Ok(()),
                     KeyCode::Enter => app.submit(tx.clone()),
+                    KeyCode::Up => app.scroll_up(1),
+                    KeyCode::Down => app.scroll_down(1),
+                    KeyCode::PageUp => app.scroll_up(app.output_view_height.max(1)),
+                    KeyCode::PageDown => app.scroll_down(app.output_view_height.max(1)),
+                    KeyCode::Home => app.scroll_to_start(),
+                    KeyCode::End => app.scroll_to_end(),
                     KeyCode::Tab => {
                         app.input_mode = match app.input_mode {
                             InputMode::Text => InputMode::Command,
@@ -351,6 +427,7 @@ fn run_app(
                         };
                         app.input.clear();
                         app.cursor = 0;
+                        app.auto_scroll = true;
                     }
                     KeyCode::Left => app.move_left(),
                     KeyCode::Right => app.move_right(),
