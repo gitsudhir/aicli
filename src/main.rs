@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::io;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -33,6 +35,8 @@ struct App {
     cursor: usize,
     last_submit: Option<String>,
     last_response: Option<String>,
+    is_loading: bool,
+    spinner_idx: usize,
 }
 
 impl App {
@@ -42,6 +46,8 @@ impl App {
             cursor: 0,
             last_submit: None,
             last_response: None,
+            is_loading: false,
+            spinner_idx: 0,
         }
     }
 
@@ -70,16 +76,21 @@ impl App {
         }
     }
 
-    fn submit(&mut self) {
+    fn submit(&mut self, tx: mpsc::Sender<Result<String, String>>) {
         if self.input.trim().is_empty() {
+            return;
+        }
+        if self.is_loading {
             return;
         }
         let prompt = self.input.clone();
         self.last_submit = Some(prompt.clone());
-        match call_ollama(&prompt) {
-            Ok(resp) => self.last_response = Some(resp),
-            Err(err) => self.last_response = Some(format!("Error: {}", err)),
-        }
+        self.is_loading = true;
+        self.last_response = None;
+        thread::spawn(move || {
+            let result = call_ollama(&prompt).map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
         self.input.clear();
         self.cursor = 0;
     }
@@ -116,7 +127,22 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> io::Result<()> {
+    let (tx, rx) = mpsc::channel::<Result<String, String>>();
+    let mut last_tick = Instant::now();
+    let spinner = ["|", "/", "-", "\\"];
     loop {
+        if let Ok(result) = rx.try_recv() {
+            app.is_loading = false;
+            match result {
+                Ok(resp) => app.last_response = Some(resp),
+                Err(err) => app.last_response = Some(format!("Error: {}", err)),
+            }
+        }
+        if last_tick.elapsed() >= Duration::from_millis(100) {
+            app.spinner_idx = (app.spinner_idx + 1) % spinner.len();
+            last_tick = Instant::now();
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
             let chunks = Layout::default()
@@ -124,11 +150,20 @@ fn run_app(
                 .constraints([Constraint::Min(3), Constraint::Length(3)])
                 .split(area);
 
-            let info_block = Block::bordered().title("Llama3 Response");
-            let info_text = app
-                .last_response
-                .as_deref()
-                .unwrap_or("Type your prompt below and press Enter.");
+            let info_title = if app.is_loading {
+                format!("Llama3 Response {}", spinner[app.spinner_idx])
+            } else {
+                "Llama3 Response".to_string()
+            };
+            let info_block = Block::bordered().title(info_title);
+            let info_text = if app.is_loading {
+                "Loading...".to_string()
+            } else {
+                app.last_response
+                    .as_deref()
+                    .unwrap_or("Type your prompt below and press Enter.")
+                    .to_string()
+            };
             let info = Paragraph::new(info_text).wrap(Wrap { trim: true }).block(info_block);
             frame.render_widget(info, chunks[0]);
 
@@ -154,7 +189,7 @@ fn run_app(
                         return Ok(());
                     }
                     KeyCode::Esc => return Ok(()),
-                    KeyCode::Enter => app.submit(),
+                    KeyCode::Enter => app.submit(tx.clone()),
                     KeyCode::Left => app.move_left(),
                     KeyCode::Right => app.move_right(),
                     KeyCode::Backspace => app.delete_char(),
