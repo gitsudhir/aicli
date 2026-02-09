@@ -1,6 +1,6 @@
-use std::error::Error;
 use std::io;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::process::Command;
@@ -13,7 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Paragraph, Wrap, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use serde::{Deserialize, Serialize};
+use rag::{answer_query, Config as RagConfig};
 
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
@@ -22,7 +22,8 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let rag_cfg = Arc::new(RagConfig::from_env());
+    let mut app = App::new(rag_cfg);
     let res = run_app(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -36,13 +37,20 @@ struct App {
     input: String,
     cursor: usize,
     last_submit: Option<String>,
-    last_response: Option<String>,
     last_command_output: Option<String>,
+    rag_context: Option<String>,
+    rag_answer: Option<String>,
+    rag_cfg: Arc<RagConfig>,
     input_mode: InputMode,
-    output_scroll: usize,
-    output_content_len: usize,
-    output_view_height: usize,
-    auto_scroll: bool,
+    output_focus: OutputFocus,
+    context_scroll: usize,
+    context_content_len: usize,
+    context_view_height: usize,
+    context_auto_scroll: bool,
+    answer_scroll: usize,
+    answer_content_len: usize,
+    answer_view_height: usize,
+    answer_auto_scroll: bool,
     is_loading: bool,
     spinner_idx: usize,
 }
@@ -53,19 +61,37 @@ enum InputMode {
     Command,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFocus {
+    Context,
+    Answer,
+}
+
+enum Response {
+    Rag(Result<(String, String), String>),
+    Index(Result<(), String>),
+}
+
 impl App {
-    fn new() -> Self {
+    fn new(rag_cfg: Arc<RagConfig>) -> Self {
         Self {
             input: String::new(),
             cursor: 0,
             last_submit: None,
-            last_response: None,
             last_command_output: None,
+            rag_context: None,
+            rag_answer: None,
+            rag_cfg,
             input_mode: InputMode::Text,
-            output_scroll: 0,
-            output_content_len: 0,
-            output_view_height: 0,
-            auto_scroll: false,
+            output_focus: OutputFocus::Answer,
+            context_scroll: 0,
+            context_content_len: 0,
+            context_view_height: 0,
+            context_auto_scroll: false,
+            answer_scroll: 0,
+            answer_content_len: 0,
+            answer_view_height: 0,
+            answer_auto_scroll: false,
             is_loading: false,
             spinner_idx: 0,
         }
@@ -96,7 +122,7 @@ impl App {
         }
     }
 
-    fn submit(&mut self, tx: mpsc::Sender<Result<String, String>>) {
+    fn submit(&mut self, tx: mpsc::Sender<Response>) {
         if self.input.trim().is_empty() {
             return;
         }
@@ -108,84 +134,99 @@ impl App {
         match self.input_mode {
             InputMode::Text => {
                 self.is_loading = true;
-                self.last_response = None;
-                self.auto_scroll = true;
+                self.answer_auto_scroll = true;
+                self.context_auto_scroll = true;
+                self.rag_context = None;
+                self.rag_answer = None;
+                let rag_cfg = self.rag_cfg.clone();
                 thread::spawn(move || {
-                    let result = call_ollama(&prompt).map_err(|err| err.to_string());
-                    let _ = tx.send(result);
+                    let result = answer_query(&rag_cfg, &prompt).map_err(|err| err.to_string());
+                    let _ = tx.send(Response::Rag(result));
                 });
             }
             InputMode::Command => {
                 self.last_command_output = Some(run_command(&prompt));
-                self.auto_scroll = true;
+                self.answer_auto_scroll = true;
             }
         }
         self.input.clear();
         self.cursor = 0;
     }
 
+    fn index_now(&mut self, tx: mpsc::Sender<Response>) {
+        if self.is_loading {
+            return;
+        }
+        self.is_loading = true;
+        self.context_auto_scroll = true;
+        self.answer_auto_scroll = true;
+        self.rag_context = Some("Indexing...".to_string());
+        self.rag_answer = Some("Building embeddings and updating Qdrant.".to_string());
+        let rag_cfg = self.rag_cfg.clone();
+        thread::spawn(move || {
+            let result = rag::index_corpus(&rag_cfg, None).map_err(|err| err.to_string());
+            let _ = tx.send(Response::Index(result));
+        });
+    }
+
     fn scroll_up(&mut self, by: usize) {
-        self.output_scroll = self.output_scroll.saturating_sub(by);
+        match self.output_focus {
+            OutputFocus::Context => {
+                self.context_scroll = self.context_scroll.saturating_sub(by);
+            }
+            OutputFocus::Answer => {
+                self.answer_scroll = self.answer_scroll.saturating_sub(by);
+            }
+        }
     }
 
     fn scroll_down(&mut self, by: usize) {
-        let max_scroll = self
-            .output_content_len
-            .saturating_sub(self.output_view_height);
-        self.output_scroll = (self.output_scroll + by).min(max_scroll);
+        match self.output_focus {
+            OutputFocus::Context => {
+                let max_scroll = self
+                    .context_content_len
+                    .saturating_sub(self.context_view_height);
+                self.context_scroll = (self.context_scroll + by).min(max_scroll);
+            }
+            OutputFocus::Answer => {
+                let max_scroll = self
+                    .answer_content_len
+                    .saturating_sub(self.answer_view_height);
+                self.answer_scroll = (self.answer_scroll + by).min(max_scroll);
+            }
+        }
     }
 
     fn scroll_to_start(&mut self) {
-        self.output_scroll = 0;
+        match self.output_focus {
+            OutputFocus::Context => self.context_scroll = 0,
+            OutputFocus::Answer => self.answer_scroll = 0,
+        }
     }
 
     fn scroll_to_end(&mut self) {
-        let max_scroll = self
-            .output_content_len
-            .saturating_sub(self.output_view_height);
-        self.output_scroll = max_scroll;
+        match self.output_focus {
+            OutputFocus::Context => {
+                let max_scroll = self
+                    .context_content_len
+                    .saturating_sub(self.context_view_height);
+                self.context_scroll = max_scroll;
+            }
+            OutputFocus::Answer => {
+                let max_scroll = self
+                    .answer_content_len
+                    .saturating_sub(self.answer_view_height);
+                self.answer_scroll = max_scroll;
+            }
+        }
     }
-}
 
-#[derive(Serialize)]
-struct OllamaRequest<'a> {
-    model: &'a str,
-    messages: Vec<OllamaMessage<'a>>,
-    stream: bool,
-}
-
-#[derive(Serialize)]
-struct OllamaMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Deserialize)]
-struct OllamaResponse {
-    message: OllamaResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct OllamaResponseMessage {
-    content: String,
-}
-
-fn call_ollama(prompt: &str) -> Result<String, Box<dyn Error>> {
-    let client = reqwest::blocking::Client::new();
-    let req = OllamaRequest {
-        model: "qwen2.5-coder:14b",
-        messages: vec![OllamaMessage {
-            role: "user",
-            content: prompt,
-        }],
-        stream: false,
-    };
-    let res: OllamaResponse = client
-        .post("http://localhost:11434/api/chat")
-        .json(&req)
-        .send()?
-        .json()?;
-    Ok(res.message.content)
+    fn focused_view_height(&self) -> usize {
+        match self.output_focus {
+            OutputFocus::Context => self.context_view_height,
+            OutputFocus::Answer => self.answer_view_height,
+        }
+    }
 }
 
 fn run_command(cmd: &str) -> String {
@@ -266,17 +307,36 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> io::Result<()> {
-    let (tx, rx) = mpsc::channel::<Result<String, String>>();
+    let (tx, rx) = mpsc::channel::<Response>();
     let mut last_tick = Instant::now();
     let spinner = ["|", "/", "-", "\\"];
     loop {
         if let Ok(result) = rx.try_recv() {
             app.is_loading = false;
             match result {
-                Ok(resp) => app.last_response = Some(resp),
-                Err(err) => app.last_response = Some(format!("Error: {}", err)),
+                Response::Rag(res) => match res {
+                    Ok((ctx, ans)) => {
+                        app.rag_context = Some(ctx);
+                        app.rag_answer = Some(ans);
+                    }
+                    Err(err) => {
+                        app.rag_context = Some("".to_string());
+                        app.rag_answer = Some(format!("Error: {}", err));
+                    }
+                },
+                Response::Index(res) => match res {
+                    Ok(()) => {
+                        app.rag_context = Some("Indexing complete.".to_string());
+                        app.rag_answer = Some("You can now run a RAG query.".to_string());
+                    }
+                    Err(err) => {
+                        app.rag_context = Some("Indexing failed.".to_string());
+                        app.rag_answer = Some(format!("Error: {}", err));
+                    }
+                },
             }
-            app.auto_scroll = true;
+            app.context_auto_scroll = true;
+            app.answer_auto_scroll = true;
         }
         if last_tick.elapsed() >= Duration::from_millis(100) {
             app.spinner_idx = (app.spinner_idx + 1) % spinner.len();
@@ -287,84 +347,153 @@ fn run_app(
             let title_style = Style::default()
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD);
-            let info_border = Style::default().fg(Color::Black).bg(Color::Gray);
+            let info_border = Style::default().fg(Color::Black);
             let input_border = Style::default().fg(Color::DarkGray);
             let help_border = Style::default().fg(Color::DarkGray);
-            let info_text_style = Style::default().fg(Color::Blue).bg(Color::Gray);
+            let info_text_style = Style::default().fg(Color::Blue);
             let help_text_style = Style::default().fg(Color::DarkGray);
             let input_text_style = Style::default().fg(Color::DarkGray);
 
             let area = frame.area();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(5), Constraint::Length(3), Constraint::Length(3)])
+                .constraints([Constraint::Min(8), Constraint::Length(3), Constraint::Length(3)])
                 .split(area);
+            let output_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(chunks[0]);
 
-            let info_title = match app.input_mode {
-                InputMode::Text => {
-                    if app.is_loading {
-                        format!("Response {}", spinner[app.spinner_idx])
-                    } else {
-                        "Response".to_string()
-                    }
-                }
-                InputMode::Command => "Command Output".to_string(),
-            };
-            let info_block = Block::bordered()
-                .title(info_title)
-                .title_style(title_style)
-                .border_style(info_border);
-            let raw_info_text = match app.input_mode {
-                InputMode::Text => {
+            let (context_text, answer_text) = match app.input_mode {
+                InputMode::Text => (
+                    app.rag_context
+                        .as_deref()
+                        .unwrap_or("Context will appear here after you run a query.")
+                        .to_string(),
                     if app.is_loading {
                         "Loading...".to_string()
                     } else {
-                        app.last_response
+                        app.rag_answer
                             .as_deref()
                             .unwrap_or("Type your prompt below and press Enter.")
                             .to_string()
+                    },
+                ),
+                InputMode::Command => (
+                    "Context is available in Text mode.".to_string(),
+                    app.last_command_output
+                        .as_deref()
+                        .unwrap_or("Type a command and press Enter.")
+                        .to_string(),
+                ),
+            };
+
+            let context_title = match app.output_focus {
+                OutputFocus::Context => "Context *",
+                OutputFocus::Answer => "Context",
+            };
+            let answer_title = match app.input_mode {
+                InputMode::Text => {
+                    if app.is_loading {
+                        format!("Answer {}{}", spinner[app.spinner_idx], match app.output_focus { OutputFocus::Answer => " *", _ => "" })
+                    } else if app.output_focus == OutputFocus::Answer {
+                        "Answer *".to_string()
+                    } else {
+                        "Answer".to_string()
                     }
                 }
-                InputMode::Command => app
-                    .last_command_output
-                    .as_deref()
-                    .unwrap_or("Type a command and press Enter.")
-                    .to_string(),
+                InputMode::Command => {
+                    if app.output_focus == OutputFocus::Answer {
+                        "Command Output *".to_string()
+                    } else {
+                        "Command Output".to_string()
+                    }
+                }
             };
-            let view_height = inner_height(chunks[0]);
-            app.output_content_len = line_count(&raw_info_text);
-            app.output_view_height = view_height;
-            if app.auto_scroll {
-                app.scroll_to_end();
-                app.auto_scroll = false;
-            } else if app.output_scroll
+
+            let context_block = Block::bordered()
+                .title(context_title)
+                .title_style(title_style)
+                .border_style(info_border);
+            let answer_block = Block::bordered()
+                .title(answer_title)
+                .title_style(title_style)
+                .border_style(info_border);
+
+            let context_view_height = inner_height(output_chunks[0]);
+            app.context_content_len = line_count(&context_text);
+            app.context_view_height = context_view_height;
+            if app.context_auto_scroll {
+                app.context_scroll = app
+                    .context_content_len
+                    .saturating_sub(app.context_view_height);
+                app.context_auto_scroll = false;
+            } else if app.context_scroll
                 > app
-                    .output_content_len
-                    .saturating_sub(app.output_view_height)
+                    .context_content_len
+                    .saturating_sub(app.context_view_height)
             {
-                app.scroll_to_end();
+                app.context_scroll = app
+                    .context_content_len
+                    .saturating_sub(app.context_view_height);
             }
 
-            let info = Paragraph::new(raw_info_text)
-                .style(info_text_style)
-                .scroll((app.output_scroll as u16, 0))
-                .wrap(Wrap { trim: true })
-                .block(info_block);
-            frame.render_widget(info, chunks[0]);
+            let answer_view_height = inner_height(output_chunks[1]);
+            app.answer_content_len = line_count(&answer_text);
+            app.answer_view_height = answer_view_height;
+            if app.answer_auto_scroll {
+                app.answer_scroll = app
+                    .answer_content_len
+                    .saturating_sub(app.answer_view_height);
+                app.answer_auto_scroll = false;
+            } else if app.answer_scroll
+                > app
+                    .answer_content_len
+                    .saturating_sub(app.answer_view_height)
+            {
+                app.answer_scroll = app
+                    .answer_content_len
+                    .saturating_sub(app.answer_view_height);
+            }
 
-            let mut scrollbar_state = ScrollbarState::new(app.output_content_len)
-                .position(app.output_scroll);
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            let context = Paragraph::new(context_text)
+                .style(info_text_style)
+                .scroll((app.context_scroll as u16, 0))
+                .wrap(Wrap { trim: true })
+                .block(context_block);
+            frame.render_widget(context, output_chunks[0]);
+
+            let mut context_scrollbar = ScrollbarState::new(app.context_content_len)
+                .position(app.context_scroll);
+            let context_scrollbar_widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .track_style(Style::default().fg(Color::DarkGray))
                 .thumb_style(Style::default().fg(Color::Blue));
             frame.render_stateful_widget(
-                scrollbar,
-                chunks[0].inner(Margin { vertical: 1, horizontal: 0 }),
-                &mut scrollbar_state,
+                context_scrollbar_widget,
+                output_chunks[0].inner(Margin { vertical: 1, horizontal: 0 }),
+                &mut context_scrollbar,
+            );
+
+            let answer = Paragraph::new(answer_text)
+                .style(info_text_style)
+                .scroll((app.answer_scroll as u16, 0))
+                .wrap(Wrap { trim: true })
+                .block(answer_block);
+            frame.render_widget(answer, output_chunks[1]);
+
+            let mut answer_scrollbar = ScrollbarState::new(app.answer_content_len)
+                .position(app.answer_scroll);
+            let answer_scrollbar_widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .track_style(Style::default().fg(Color::DarkGray))
+                .thumb_style(Style::default().fg(Color::Blue));
+            frame.render_stateful_widget(
+                answer_scrollbar_widget,
+                output_chunks[1].inner(Margin { vertical: 1, horizontal: 0 }),
+                &mut answer_scrollbar,
             );
 
             let input_title = match app.input_mode {
-                InputMode::Text => "Prompt (Text)",
+                InputMode::Text => "Prompt (RAG)  [Ctrl+R: Index]",
                 InputMode::Command => "Command (Direct)",
             };
             let input_block = Block::bordered()
@@ -390,10 +519,10 @@ fn run_app(
                 .border_style(help_border);
             let help_text = match app.input_mode {
                 InputMode::Text => {
-                    "Enter: Send to LLM | Tab: Toggle | Up/Down/PgUp/PgDn/Home/End: Scroll | Esc/Ctrl+C: Quit"
+                    "Enter: Run RAG | F2/Ctrl+R: Index | Tab: Mode | Ctrl+O: Focus | Up/Down/PgUp/PgDn/Home/End: Scroll | Esc/Ctrl+C: Quit"
                 }
                 InputMode::Command => {
-                    "Enter: Run command | Tab: Toggle | Up/Down/PgUp/PgDn/Home/End: Scroll | Esc/Ctrl+C: Quit"
+                    "Enter: Run command | F2/Ctrl+R: Index | Tab: Mode | Ctrl+O: Focus | Up/Down/PgUp/PgDn/Home/End: Scroll | Esc/Ctrl+C: Quit"
                 }
             };
             let help = Paragraph::new(help_text)
@@ -412,14 +541,26 @@ fn run_app(
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
+                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.index_now(tx.clone());
+                    }
+                    KeyCode::F(2) => {
+                        app.index_now(tx.clone());
+                    }
                     KeyCode::Esc => return Ok(()),
                     KeyCode::Enter => app.submit(tx.clone()),
                     KeyCode::Up => app.scroll_up(1),
                     KeyCode::Down => app.scroll_down(1),
-                    KeyCode::PageUp => app.scroll_up(app.output_view_height.max(1)),
-                    KeyCode::PageDown => app.scroll_down(app.output_view_height.max(1)),
+                    KeyCode::PageUp => app.scroll_up(app.focused_view_height().max(1)),
+                    KeyCode::PageDown => app.scroll_down(app.focused_view_height().max(1)),
                     KeyCode::Home => app.scroll_to_start(),
                     KeyCode::End => app.scroll_to_end(),
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.output_focus = match app.output_focus {
+                            OutputFocus::Context => OutputFocus::Answer,
+                            OutputFocus::Answer => OutputFocus::Context,
+                        };
+                    }
                     KeyCode::Tab => {
                         app.input_mode = match app.input_mode {
                             InputMode::Text => InputMode::Command,
@@ -427,7 +568,8 @@ fn run_app(
                         };
                         app.input.clear();
                         app.cursor = 0;
-                        app.auto_scroll = true;
+                        app.context_auto_scroll = true;
+                        app.answer_auto_scroll = true;
                     }
                     KeyCode::Left => app.move_left(),
                     KeyCode::Right => app.move_right(),
