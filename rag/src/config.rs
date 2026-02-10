@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -47,7 +48,10 @@ impl Config {
             embed_model: env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string()),
             chat_model: env::var("OLLAMA_CHAT_MODEL").unwrap_or_else(|_| "qwen2.5-coder:14b".to_string()),
             qdrant_url: env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()),
-            collection: env::var("QDRANT_COLLECTION").unwrap_or_else(|_| "rag_chunks".to_string()),
+            collection: env::var("QDRANT_COLLECTION").unwrap_or_else(|_| {
+                let repo = current_folder_name().unwrap_or_else(|| "default".to_string());
+                format!("{}_rag_chunks", sanitize_collection_name(&repo))
+            }),
             distance: env::var("QDRANT_DISTANCE").unwrap_or_else(|_| "Cosine".to_string()),
             top_k: env::var("RAG_TOP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(5),
             system_prompt: env::var("RAG_SYSTEM_PROMPT").unwrap_or_else(|_| {
@@ -55,4 +59,23 @@ impl Config {
             }),
         }
     }
+}
+
+fn current_folder_name() -> Option<String> {
+    let cwd = env::current_dir().ok()?;
+    cwd.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+}
+
+fn sanitize_collection_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else if c.is_ascii_whitespace() || c == '.' {
+            out.push('_');
+        }
+    }
+    if out.is_empty() { "default".to_string() } else { out }
 }
