@@ -10,7 +10,7 @@ pub fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut resp = client.get(url).send().map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().map_err(|e| e.to_string())?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -24,7 +24,7 @@ pub fn post_json<T: DeserializeOwned, B: Serialize>(url: &str, body: &B) -> Resu
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut resp = client
+    let resp = client
         .post(url)
         .header(CONTENT_TYPE, "application/json")
         .json(body)
@@ -43,7 +43,7 @@ pub fn put_json<T: DeserializeOwned, B: Serialize>(url: &str, body: &B) -> Resul
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut resp = client
+    let resp = client
         .put(url)
         .header(CONTENT_TYPE, "application/json")
         .json(body)

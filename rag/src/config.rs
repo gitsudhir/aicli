@@ -1,5 +1,4 @@
 use std::env;
-use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct Config {
