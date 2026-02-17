@@ -1,3 +1,6 @@
+mod agent {
+    include!("../../agent/agent.rs");
+}
 mod build_prompt;
 mod chunk_text;
 mod config;
@@ -5,12 +8,17 @@ mod embed_chunks;
 mod embed_query;
 mod generate;
 mod http;
+mod mcp {
+    include!("../../mcp/mcp.rs");
+}
 mod retrieve_chunks;
 mod scan_files;
 mod store_qdrant;
 
+pub use agent::{AgentState, Decision, answer_query_hybrid, parse_decision, run_agent};
 pub use build_prompt::{build_prompt_with_context, Message};
 pub use config::Config;
+pub use mcp::{McpCapabilities, McpClient};
 
 use chunk_text::chunk_text;
 use embed_chunks::embed_texts;
@@ -63,6 +71,10 @@ pub fn index_corpus(cfg: &Config, source: Option<&str>) -> Result<(), String> {
 }
 
 pub fn answer_query(cfg: &Config, question: &str) -> Result<(String, String), String> {
+    answer_query_hybrid(cfg, question)
+}
+
+pub fn answer_query_classic(cfg: &Config, question: &str) -> Result<(String, String), String> {
     let query_vec = embed_query(cfg, question)?;
     let hits = retrieve_top(cfg, &query_vec)?;
     let (messages, context) = build_prompt_with_context(cfg, question, &hits);

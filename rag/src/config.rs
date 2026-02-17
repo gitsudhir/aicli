@@ -16,10 +16,17 @@ pub struct Config {
     pub distance: String,
     pub top_k: usize,
     pub system_prompt: String,
+    pub hybrid_system_prompt: String,
+    pub mcp_url: String,
+    pub mcp_command: String,
+    pub mcp_args: Vec<String>,
+    pub agent_max_steps: usize,
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        // Load .env if present so MCP and model config work without manual `source .env`.
+        let _ = dotenvy::dotenv();
         let include_exts = env::var("RAG_INCLUDE_EXTS").unwrap_or_else(|_| {
             ".rs,.md,.txt,.toml,.json,.yaml,.yml,.py,.js,.ts,.tsx,.html,.css".to_string()
         });
@@ -56,6 +63,20 @@ impl Config {
             system_prompt: env::var("RAG_SYSTEM_PROMPT").unwrap_or_else(|_| {
                 "You are a helpful coding assistant. Use only the provided context.".to_string()
             }),
+            hybrid_system_prompt: env::var("RAG_HYBRID_SYSTEM_PROMPT").unwrap_or_else(|_| {
+                "You are a hybrid AI agent.\n\nYou can:\n- Retrieve knowledge from documents.\n- Call MCP tools.\n- Fetch MCP prompts.\n- Read MCP resources.\n- Answer directly if no external action is required.\n\nAlways respond in valid JSON with one action:\nretrieve | tool | prompt | resource | final\n\nDo not output plain text.".to_string()
+            }),
+            mcp_url: env::var("MCP_URL").unwrap_or_default(),
+            mcp_command: env::var("MCP_COMMAND").unwrap_or_default(),
+            mcp_args: env::var("MCP_ARGS")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect(),
+            agent_max_steps: env::var("RAG_AGENT_MAX_STEPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
         }
     }
 }

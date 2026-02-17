@@ -40,6 +40,7 @@ The application consists of two main components:
 - Vector embedding generation
 - Qdrant database integration
 - Query processing and response generation
+- MCP integration via `mcp-client-rust` (client layer for tools/resources/prompts)
 
 ## Installation
 
@@ -116,6 +117,28 @@ export SCAN_DIRECTORIES="/path/to/documents,/another/path"
 export FILE_EXTENSIONS=".txt,.md,.rs,.py,.js"  # Comma-separated list
 ```
 
+### MCP Setup (Stdio)
+
+`aicli` uses the `mcp-client-rust` crate as its MCP client layer.  
+Configure the MCP server endpoint/command through env vars (stdio example below):
+
+```bash
+# leave MCP_URL empty when using stdio transport
+MCP_URL=
+MCP_COMMAND=/Users/sudhirkumar/Desktop/sudhir/gitsudhir/mcp-server-rust/target/release/mcp-server-rust
+MCP_ARGS=
+```
+
+With your server, the agent can discover and use:
+- tools: `greet`, `calculate-bmi`, `fetch-weather`
+- resource: `config://app`
+- prompt: `review-code`
+
+Quick check:
+1. Start the app with `cargo run`
+2. Ask: `use MCP tool greet with name Alice`
+3. Ask: `read MCP resource config://app`
+
 ## Project Structure
 
 ```
@@ -149,9 +172,11 @@ aicli/
 - `rag` - Local RAG library (path dependency)
 
 ### RAG Library
+- `mcp-client-rust` - MCP client transport and protocol handling
 - `reqwest` - HTTP client for API calls
 - `serde` - Serialization/deserialization
 - `serde_json` - JSON handling
+- `tokio` - Async runtime (used by MCP client integration)
 - `walkdir` - File system traversal
 
 ## Development
