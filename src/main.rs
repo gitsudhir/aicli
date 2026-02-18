@@ -126,6 +126,25 @@ impl App {
         }
     }
 
+    fn extract_file_references(input: &str) -> Vec<String> {
+        input
+            .split_whitespace()
+            .filter(|word| word.starts_with('@'))
+            .map(|s| s.trim_start_matches('@').to_string())
+            .collect()
+    }
+
+    fn resolve_path(file: &str) -> std::path::PathBuf {
+        let path = std::path::Path::new(file);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(path)
+        }
+    }
+
     fn submit(&mut self, tx: mpsc::UnboundedSender<Response>) {
         if self.input.trim().is_empty() || self.is_loading {
             return;
@@ -136,16 +155,53 @@ impl App {
 
         match self.input_mode {
             InputMode::Text => {
-                self.is_loading = true;
-                self.answer_auto_scroll = true;
-                self.context_auto_scroll = true;
-                self.rag_context = None;
-                self.rag_answer = None;
-                let rag_cfg = self.rag_cfg.clone();
-                tokio::task::spawn_blocking(move || {
-                    let result = answer_query(&rag_cfg, &prompt).map_err(|err| err.to_string());
-                    let _ = tx.send(Response::Rag(result));
-                });
+                if prompt.contains('@') {
+                    // File injection mode: read files and append their contents to prompt
+                    let file_refs = Self::extract_file_references(&prompt);
+                    let mut prompt_with_files = prompt.clone();
+                    for file in file_refs {
+                        let path = Self::resolve_path(&file);
+                        match std::fs::read_to_string(&path) {
+                            Ok(content) => {
+                                let replacement = format!("----- START FILE {} -----\n{}\n----- END FILE {} -----", file, content, file);
+                                prompt_with_files = prompt_with_files.replace(&format!("@{}", file), &replacement);
+                            }
+                            Err(e) => {
+                                let replacement = format!("(Could not read file {}: {})", file, e);
+                                prompt_with_files = prompt_with_files.replace(&format!("@{}", file), &replacement);
+                            }
+                        }
+                    }
+                    self.is_loading = true;
+                    self.answer_auto_scroll = true;
+                    self.context_auto_scroll = true;
+                    self.rag_context = None;
+                    self.rag_answer = None;
+
+                    let rag_cfg = self.rag_cfg.clone();
+                    let processed_prompt = prompt_with_files;
+                    tokio::task::spawn_blocking(move || {
+                        // println!("=== Sending to RAG ===\n{}", processed_prompt);
+                        let result = answer_query(&rag_cfg, &processed_prompt)
+                            .map_err(|err| err.to_string());
+                        // println!("=== RAG Result === {:?}", result);
+                        let _ = tx.send(Response::Rag(result));
+                    });
+                } else {
+                    // Pure RAG mode
+                    self.is_loading = true;
+                    self.answer_auto_scroll = true;
+                    self.context_auto_scroll = true;
+                    self.rag_context = None;
+                    self.rag_answer = None;
+
+                    let rag_cfg = self.rag_cfg.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = answer_query(&rag_cfg, &prompt)
+                            .map_err(|err| err.to_string());
+                        let _ = tx.send(Response::Rag(result));
+                    });
+                }
             }
             InputMode::Command => {
                 self.is_loading = true;
@@ -154,6 +210,7 @@ impl App {
                     let _ = tx.send(Response::Command(run_command(&prompt)));
                 });
             }
+            
         }
 
         self.input.clear();
@@ -355,7 +412,7 @@ fn draw_ui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         .unwrap_or("Type a command and press Enter.")
                         .to_string()
                 },
-            ),
+            )
         };
 
         let context_title = match app.output_focus {
@@ -396,6 +453,7 @@ fn draw_ui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     "Command Output".to_string()
                 }
             }
+           
         };
 
         let context_block = Block::bordered()
@@ -470,6 +528,7 @@ fn draw_ui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         let input_title = match app.input_mode {
             InputMode::Text => "Prompt (RAG)  [Ctrl+R: Index]",
             InputMode::Command => "Command (Direct)",
+           
         };
         let input_block = Block::bordered()
             .title(input_title)
@@ -555,6 +614,7 @@ async fn run_app(
                         Response::Command(output) => {
                             app.last_command_output = Some(output);
                         }
+                        
                     }
                     app.context_auto_scroll = true;
                     app.answer_auto_scroll = true;

@@ -34,7 +34,7 @@ impl Config {
             source_dir: env::var("RAG_SOURCE_DIR").unwrap_or_else(|_| "./".to_string()),
             include_exts: include_exts.split(',').map(|s| s.trim().to_string()).collect(),
             exclude_dirs: env::var("RAG_EXCLUDE_DIRS")
-                .unwrap_or_else(|_| ".git,target,node_modules,.idea,.vscode,dist,build".to_string())
+                .unwrap_or_else(|_| ".git,target,node_modules,.idea,.vscode,dist,build,qdrant_storage,.qoder".to_string())
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),

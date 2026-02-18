@@ -13,15 +13,17 @@ pub fn chunk_text(text: &str, cfg: &Config) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut start = 0usize;
-    let length = text.len();
+    let chars: Vec<char> = text.chars().collect();
+    let len_chars = chars.len();
 
-    while start < length {
-        let end = (start + size).min(length);
-        let chunk = text[start..end].trim();
-        if !chunk.is_empty() {
-            chunks.push(chunk.to_string());
+    while start < len_chars {
+        let end = (start + size).min(len_chars);
+        let chunk_str: String = chars[start..end].iter().collect();
+        let trimmed = chunk_str.trim();
+        if !trimmed.is_empty() {
+            chunks.push(trimmed.to_string());
         }
-        if end == length {
+        if end == len_chars {
             break;
         }
         start = end.saturating_sub(overlap);
